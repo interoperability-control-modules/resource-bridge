@@ -35,8 +35,7 @@ The presentation service only answers mapping and transformation questions (`res
 ## Requirements
 
 - `volttron-core` >= 2.0.0rc30
-- `interoperability-service` (provides `interoperability.transform_parser`) running as
-  `platform.presentation`, installed in the adapter's environment too
+- the interoperability service running as `platform.presentation`
 - the platform driver (`platform.driver`) owning the devices at both ends
 
 ## Configuration
@@ -63,7 +62,7 @@ one with an `rpc_topic`. An end written as `{"uai": ..., "bus": true}` is a *bus
 is a topic on the VOLTTRON bus carrying messages in the UAI's alias format, an OpenFMB profile topic
 such as `openfmb/solarmodule/SolarControlProfile/<mRID>`. A bus source is subscribed to (messages
 published by this agent itself are ignored); a bus target is published to with the headers of
-`interoperability.openfmb_bus` (content type, protobuf message name, origin). This is how OpenFMB
+`icm.resources.openfmb.bus` (content type, protobuf message name, origin). This is how OpenFMB
 lives on the VOLTTRON bus: the Message Bus Adapter in `relay` mode re-serialises those topics to and
 from the foreign bus, and any OpenFMB-aware agent can publish or consume them.
 
@@ -78,10 +77,39 @@ from the foreign bus, and any OpenFMB-aware agent can publish or consume them.
 `stale_after` (seconds, unset by default) makes the agent ask the driver's `last` RPC for a target
 point whose last known value is older than that, or unknown, before deciding whether to write it;
 unset, the agent relies on the target's publications and its own writes. The tracking is done by
-`interoperability.resource.ResourceWriter`, one per target device.
+`icm.resources.resource.ResourceWriter`, one per target device.
 
 Served devices (a server the platform runs) must be declared with their own device format,
 generated with the discovery tools' `--served` flag, so the write edges into their inputs exist.
+
+### Ends declared locally
+
+An end may carry a `definition` instead of being resolved through the presentation service: a canonical
+(`data_format`, `publication_topic`, `rpc_topic`, `parameters`) or an alias (`target_format`, `codec`, the
+`transform` stage list) in the form of `icm.resources.definitions`. The UAI then only names the end; the service
+is not consulted for it, and the chain between the two ends still comes from the service.
+
+```json
+{"bridges": [{"name": "pv_to_mirror",
+              "source": {"uai": ["site1", "pv"], "definition": {"kind": "canonical", "uai": ["site1", "pv"],
+                         "data_format": "fake_pv", "publication_topic": "devices/site1/pv/all", "rpc_topic": "devices/site1/pv"}},
+              "target": "site1/mirror"}]}
+```
+
+### Delivery
+
+A bridge's `delivery` says when the source's arrivals become one message for the chain (`icm.resources.DeliveryPolicy`):
+`each` (every arrival as it comes, the default), `complete` (once every field the chain reads has arrived since the
+last write, or after `max_wait` seconds with what is present), `merge` (every arrival merged over the last known
+values of the other fields, `stale_after` dropping old ones), `interval` (every `interval` seconds from the last known
+values) or `trigger` (when one of `fields` changes). The fields the chain reads are learned from the chains the
+service returns. Each result report then carries an `assembly` record naming the fields that were fresh, merged or
+missing.
+
+```json
+{"bridges": [{"name": "pv_to_sep2", "source": "site1/pv", "target": "site1/pv_sep2_server",
+              "delivery": {"kind": "complete", "max_wait": 5}}]}
+```
 
 ## RPC
 
@@ -91,6 +119,9 @@ generated with the discovery tools' `--served` flag, so the write edges into the
 - `write(uai, message, as_format=None)`: write a protocol message (in `as_format`, or the format
   of the outermost alias in `uai`) to the device the UAI leads to. Returns the write result with the
   chain's path and retention.
+
+- `local_definitions()`: the definitions this agent declares on its bridge ends, as `[{bridge, end, uai, definition}]`,
+  so a configuration tool can show them beside the service's resources.
 
 ## Tests
 

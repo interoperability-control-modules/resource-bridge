@@ -27,7 +27,7 @@ A *bridge* has a source and a target. A device end is a device behind the platfo
 (the ``devices/<device>/all`` polls and the ``/multi`` pushes a served device receives from its peer), written through
 ``set_multiple_points``. A bus end is a topic on VOLTTRON's own bus carrying messages in the end's alias format, an
 OpenFMB profile topic (``openfmb/<module>/<Profile>/<mRID>``) in practice: read from it, or published to it with the
-headers of ``interoperability.openfmb_bus``. The presentation service supplies the chain between the two formats,
+headers of ``icm.resources.openfmb.bus``. The presentation service supplies the chain between the two formats,
 scored on the fields each message carries; this agent owns the subscriptions, the writes and publishes, and the policy
 (change-only writes, echo suppression, ordered curve batches, per-point error reporting).
 
@@ -59,9 +59,10 @@ except PackageNotFoundError:
     from volttron.platform.messaging.health import STATUS_BAD, STATUS_GOOD
     from volttron.platform.vip.agent import Agent, RPC
 
-from interoperability import openfmb_bus
-from interoperability.resource import ALL, MULTI, ResourceWriter, message_values, same_value
-from interoperability.transform_parser import TransformParser
+from icm.resources.openfmb import bus as openfmb_bus
+from icm.resources.assembler import Assembler, Ticker
+from icm.resources.resource import ALL, MULTI, ResourceWriter, message_values, same_value
+from icm.transforms.parser import TransformParser
 
 from .config import BridgeConfig, ResourceBridgeConfig, EndConfig
 from .writer import DeviceWriter, WriteResult
@@ -129,6 +130,8 @@ class Bridge:
     chains: 'OrderedDict[frozenset, Chain]' = field(default_factory=OrderedDict)
     callbacks: list = field(default_factory=list)
     stopped: bool = False       # set by _stop_bridge; a late message on a subscription not yet dropped is ignored
+    assembler: Any = None       # when the bridge has a delivery policy other than each: decides when arrivals become a message
+    ticker: Any = None          # runs the assembler's clock for complete(max_wait) and interval
     # Relays of one bridge run in order, one at a time, in their own greenlets: a slow write (a batch of DNP3 operates
     # can take minutes) must not hold the agent's subscription loop, which delivers every bridge's messages.
     lock: 'RLock' = field(default_factory=lambda: RLock())
@@ -217,7 +220,7 @@ class ResourceBridgeAgent(Agent):
         return self._rpc(self.config.presentation_service, 'resolve', list(uai), **kwargs) or {}
 
     def _resolve_end(self, bridge: str, end: EndConfig, role: str) -> End | None:
-        resolved = self._resolve(end.uai)
+        resolved = end.definition.as_resolved() if end.definition is not None else self._resolve(end.uai)
         if not resolved:
             self._report_bad_status(f'Bridge {bridge}: {end.key} leads to no resource the presentation service knows.')
             return None
@@ -264,6 +267,10 @@ class ResourceBridgeAgent(Agent):
         if source is None or target is None:
             return None
         bridge = Bridge(config, source, target)
+        if config.delivery is not None and config.delivery.kind != 'each':
+            bridge.assembler = Assembler(config.delivery, config.points or ())
+            if config.delivery.kind == 'interval':
+                self._arm_ticker(bridge)
         if not target.bus:
             self._writer_for(target.key, target.rpc_topic, target.publication_topic)   # start learning what it holds
         for topic in source.topics:
@@ -277,8 +284,24 @@ class ResourceBridgeAgent(Agent):
                   f'{target.topics[0] if target.bus else target.rpc_topic} ({target.format}).')
         return bridge
 
+    def _arm_ticker(self, bridge: Bridge) -> None:
+        """Run the assembler's clock when its policy needs one (complete with max_wait, interval): a due emit is relayed
+        like an arrival, under the bridge's lock."""
+        if bridge.assembler is None or bridge.ticker is not None or bridge.assembler.next_due() is None:
+            return
+
+        def on_due(emit):
+            with bridge.lock:
+                if not bridge.stopped:
+                    self._deliver(bridge, bridge.source.topics[0], emit.values, emit.as_header())
+        bridge.ticker = Ticker(bridge.assembler, on_due)
+        bridge.ticker.start()
+
     def _stop_bridge(self, bridge: Bridge):
         bridge.stopped = True               # from here on its handlers ignore messages, whatever the unsubscribe does
+        if bridge.ticker is not None:
+            bridge.ticker.cancel()
+            bridge.ticker = None
         for topic, handle in bridge.callbacks:
             try:
                 self.vip.pubsub.unsubscribe(peer='pubsub', prefix=topic, callback=handle)
@@ -309,6 +332,17 @@ class ResourceBridgeAgent(Agent):
             values = self._without_echoes(bridge.source.key, values)
         if not values:
             return None
+        assembly = None
+        if bridge.assembler is not None:
+            emit = bridge.assembler.offer(values)
+            self._arm_ticker(bridge)
+            if emit is None:
+                return None                                               # the policy is still waiting
+            values, assembly = emit.values, emit.as_header()
+        return self._deliver(bridge, topic, values, assembly)
+
+    def _deliver(self, bridge: Bridge, topic: str, values: dict, assembly: dict | None = None) -> WriteResult | None:
+        """Run the chain on an assembled set of values and write or publish the result."""
         try:
             chain = self._chain_for(bridge, values)
             out = chain.transform.execute(values)
@@ -322,7 +356,7 @@ class ResourceBridgeAgent(Agent):
             return None
         out = {k: v for k, v in out.items() if v is not None}   # a point without a value is not a write
         if bridge.target.bus:
-            return self._publish(bridge, topic, chain, out)
+            return self._publish(bridge, topic, chain, out, assembly)
         tracker = self._writer_for(bridge.target.key, bridge.target.rpc_topic, bridge.target.publication_topic)
         candidates = len(out)
         out = tracker.select(out, force=bridge.config.write_unchanged)
@@ -338,13 +372,13 @@ class ResourceBridgeAgent(Agent):
             bridge.stats['last_error'] = next(iter(result.errors.values()))
         tracker.record(result.written)
         self._remember(bridge.target.key, result.written)
-        self._report(bridge, topic, chain, {'target': bridge.target.rpc_topic, **result.as_dict()})
+        self._report(bridge, topic, chain, {'target': bridge.target.rpc_topic, **result.as_dict(), **({'assembly': assembly} if assembly else {})})
         if result.errors:
             _log.warning(f'Bridge {bridge.key}: {len(result.written)} written, {len(result.errors)} refused: '
                          f'{dict(list(result.errors.items())[:3])}')
         return result
 
-    def _publish(self, bridge: Bridge, topic: str, chain: Chain, out: dict) -> WriteResult:
+    def _publish(self, bridge: Bridge, topic: str, chain: Chain, out: dict, assembly: dict | None = None) -> WriteResult:
         """A bus target: the transformed message goes on the target's topic with the OpenFMB-on-bus headers."""
         if not out:
             return WriteResult()
@@ -354,7 +388,7 @@ class ResourceBridgeAgent(Agent):
         bridge.stats['publishes'] += 1
         bridge.stats['points_written'] += len(out)
         bridge.stats['last_write'] = time.time()
-        self._report(bridge, topic, chain, {'target': target_topic, 'published': True, **result.as_dict()})
+        self._report(bridge, topic, chain, {'target': target_topic, 'published': True, **result.as_dict(), **({'assembly': assembly} if assembly else {})})
         return result
 
     def _report(self, bridge: Bridge, source_topic: str, chain: Chain, body: dict):
@@ -373,6 +407,10 @@ class ResourceBridgeAgent(Agent):
         chain = Chain(parser.build_transform_from_schema(resolved.get('transform') or []),
                       list(resolved.get('path') or [bridge.source.format, bridge.target.format]), float(resolved.get('retention', 1.0)))
         bridge.chains[key] = chain
+        if bridge.assembler is not None and resolved.get('transform'):
+            # The fields the chain reads are what a complete/merge/trigger policy waits for or fills in.
+            sources = parser.field_map(resolved['transform']).sources()
+            bridge.assembler.required = bridge.assembler.required | frozenset(str(src[0]) for src in sources if src and str(src[0]) != '#')
         while len(bridge.chains) > self.config.chain_cache_size:
             bridge.chains.popitem(last=False)
         _log.info(f'Bridge {bridge.key}: {" -> ".join(chain.path)} retains {chain.retention:.0%} of {len(fields)} fields.')
@@ -401,6 +439,14 @@ class ResourceBridgeAgent(Agent):
             recent[point] = (value, now)
 
     # ---- RPC -----------------------------------------------------------------------------------------------------
+    @RPC.export
+    def local_definitions(self) -> list[dict]:
+        """The resources this agent declares on its bridge ends rather than resolving through the presentation service,
+        as configured: ``[{bridge, end, uai, definition}]``. A configuration UI that reads the store sees only the
+        service's resources; this is how it learns about an agent's own."""
+        return [{'bridge': b.key, 'end': role, 'uai': list(end.uai), 'definition': end.definition.model_dump(mode='json')}
+                for b in self.config.bridges for role, end in (('source', b.source), ('target', b.target)) if end.definition is not None]
+
     @RPC.export
     def list_bridges(self) -> list[dict]:
         """The configured bridges, with their resolved ends and the chains used so far."""

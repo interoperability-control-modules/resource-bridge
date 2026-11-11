@@ -29,7 +29,7 @@ from typing import Any, Callable
 
 _log = logging.getLogger(__name__)
 
-from interoperability.resource import SEQUENCE     # the key of ordered write batches (curve writes)
+from icm.resources.resource import SEQUENCE     # the key of ordered write batches (curve writes)
 
 
 @dataclass

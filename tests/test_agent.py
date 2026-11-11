@@ -213,7 +213,7 @@ def test_write_rpc_writes_a_protocol_message_to_a_device(world):
 def test_bus_ends_publish_and_consume_openfmb_profiles(world):
     """A device -> OpenFMB topic bridge publishes the profile with the on-bus headers; an OpenFMB topic -> device
     bridge writes what arrives there, except what this agent published itself."""
-    from interoperability import openfmb_bus
+    from icm.resources.openfmb import bus as openfmb_bus
     a, fake = world
     a.core.identity = 'platform.resource_bridge'
     a.configure_main(None, 'NEW', {'bridges': [
@@ -343,3 +343,64 @@ def test_statistics_count_messages_writes_skips_and_drift(world):
     assert stats['points_skipped'] == 1                      # the repeated W was already held by the target
     assert stats['last_message'] and stats['last_write'] and stats['last_error'] is None and stats['transform_errors'] == 0
     assert stats['enabled'] and stats['target'] == ['site1', 'mirror'] and stats['target_bus'] is False and stats['drifted'] == {}
+
+
+LOCAL_SOURCE = {'kind': 'canonical', 'uai': ['site9', 'pv'], 'data_format': 'fake_pv', 'publication_topic': 'devices/site9/pv/all', 'rpc_topic': 'devices/site9/pv'}
+LOCAL_TARGET = {'kind': 'canonical', 'uai': ['site9', 'mirror'], 'data_format': 'fake_mirror', 'publication_topic': 'devices/site9/mirror/all', 'rpc_topic': 'devices/site9/mirror'}
+
+
+def test_ends_with_local_definitions_need_no_resolve(world):
+    """Ends declared in the configuration are never resolved through the service; the chain still comes from it."""
+    a, fake = world
+    a.configure_main(None, 'NEW', {'bridges': [{'name': 'local', 'source': {'uai': ['site9', 'pv'], 'definition': LOCAL_SOURCE},
+                                                 'target': {'uai': ['site9', 'mirror'], 'definition': LOCAL_TARGET}}]})
+    assert not [c for c in fake.calls if c[1] == 'resolve']
+    assert set(fake.subscriptions) >= {'devices/site9/pv/all', 'devices/site9/pv/multi'}
+    fake.subscriptions['devices/site9/pv/all']('pubsub', 'platform.driver', 'bus', 'devices/site9/pv/all', {}, [{'W': 2500}, {}])
+    assert writes(fake) and writes(fake)[-1][0] == 'devices/site9/mirror'
+    listed = a.local_definitions()
+    assert {(d['bridge'], d['end']) for d in listed} == {('local', 'source'), ('local', 'target')} and listed[0]['definition']['kind'] == 'canonical'
+
+
+def test_complete_delivery_waits_for_the_fields_the_chain_reads(world):
+    """With a complete policy the bridge writes once the chain's source fields have all arrived, merged, and the
+    report says which were fresh and which merged."""
+    a, fake = world
+    configure(a, delivery={'kind': 'complete'})
+    bridge = a.bridges['pv_to_mirror']
+    assert bridge.assembler is not None and bridge.assembler.required == frozenset()
+    publish = fake.subscriptions['devices/site1/pv/multi']
+    publish('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/multi', {}, [{'W': 1000}, {}])
+    first_writes = len(writes(fake))                     # the first arrival learns the chain's fields and emits (nothing required yet)
+    assert bridge.assembler.required >= {'W'}
+    bridge.assembler.required = frozenset({'W', 'Hz'})
+    publish('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/multi', {}, [{'W': 1100}, {}])
+    assert len(writes(fake)) == first_writes             # Hz still missing: nothing written
+    publish('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/multi', {}, [{'Hz': 60}, {}])
+    assert len(writes(fake)) == first_writes + 1
+    report = [m for t, m in fake.published if t.startswith('resource_bridge/')][-1]
+    assert report['assembly']['reason'] == 'complete' and report['assembly']['fresh'] == ['Hz'] and report['assembly']['merged'] == ['W']
+
+
+def test_interval_delivery_runs_a_ticker_and_stops_with_the_bridge(world):
+    gevent = pytest.importorskip('gevent')
+    a, fake = world
+    configure(a, delivery={'kind': 'interval', 'interval': 0.2})
+    bridge = a.bridges['pv_to_mirror']
+    assert bridge.ticker is not None
+    fake.subscriptions['devices/site1/pv/multi']('pubsub', 'platform.driver', 'bus', 'devices/site1/pv/multi', {}, [{'W': 1000}, {}])
+    before = len(writes(fake))
+    gevent.sleep(0.5)
+    assert len(writes(fake)) > before                    # written on the clock, not on arrival
+    a.configure_main(None, 'UPDATE', {'bridges': []})
+    assert bridge.ticker is None and bridge.stopped
+    n = len(writes(fake)); gevent.sleep(0.3)
+    assert len(writes(fake)) == n
+
+
+def test_delivery_policy_is_validated_in_configuration():
+    from resource_bridge.config import ResourceBridgeConfig
+    with pytest.raises(Exception):
+        ResourceBridgeConfig(bridges=[{'source': 'a/b', 'target': 'c/d', 'delivery': {'kind': 'interval'}}])
+    cfg = ResourceBridgeConfig(bridges=[{'source': 'a/b', 'target': 'c/d', 'delivery': {'kind': 'merge', 'stale_after': 30}}])
+    assert cfg.bridges[0].delivery.kind == 'merge'

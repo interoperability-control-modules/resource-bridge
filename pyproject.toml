@@ -2,6 +2,37 @@
 requires = ["poetry-core>=2.0.0"]
 build-backend = "poetry.core.masonry.api"
 
+[project]
+name = "volttron-resource-bridge"
+version = "2.0.0rc0"
+description = "The VOLTTRON Resource Bridge Agent bridges one device into another across protocols."
+authors = [{name = "The VOLTTRON Development Team", email = "volttron@pnnl.gov"}]
+license = "Apache-2.0"
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Developers",
+]
+dependencies = [
+    "volttron-core>=2.0.0rc30",
+    "pydantic>=2.0,<3.0",
+    "icm-lib-transforms>=0.1.0",
+    "icm-lib-resources[volttron]>=0.1.0",
+]
+
+[project.scripts]
+volttron-resource-bridge = "resource_bridge.agent:main"
+
+[project.urls]
+Repository = "https://github.com/interoperability-control-modules/resource-bridge"
+Homepage = "https://github.com/interoperability-control-modules/resource-bridge"
+
+[tool.poetry]
+packages = [{ include = "resource_bridge", from = "src" }]
+
 [tool.isort]
 profile = "black"
 
@@ -15,37 +46,6 @@ warn_unused_configs = true
 show_error_codes = true
 exclude = ['docs/']
 
-[[tool.mypy.overrides]]
-module = ["gevent.*", "mock.*", "pytest.*", "volttron.*", "interoperability.*"]
-ignore_missing_imports = true
-
-[tool.poetry]
-name = "volttron-resource-bridge"
-version = "2.0.0rc0"
-description = "The VOLTTRON Resource Bridge Agent bridges one device into another across protocols."
-authors = ["The VOLTTRON Development Team <volttron@pnnl.gov>"]
-license = "Apache License 2.0"
-readme = "README.md"
-repository = "https://github.com/eclipse-volttron/volttron-resource-bridge"
-homepage = "https://github.com/eclipse-volttron/volttron-resource-bridge"
-keywords = []
-packages = [ { include = "resource_bridge", from = "src" } ]
-classifiers = [
-    "Programming Language :: Python :: 3 :: Only",
-    "Intended Audience :: Science/Research",
-    "Intended Audience :: Information Technology",
-    "Intended Audience :: Developers",
-    "Intended Audience :: Other Audience",
-    "License :: OSI Approved :: Apache Software License"
-]
-
-[tool.poetry.dependencies]
-python = ">=3.10,<4.0"
-volttron-core = ">=2.0.0rc30"
-pydantic = "^2.0"
-# TODO: interoperability-service (provides interoperability.transform_parser) is not yet published.
-#  It must be installed alongside this agent, e.g. from ../interoperability_service.
-
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"
 pytest-cov = "^6.0.0"
@@ -55,9 +55,6 @@ yapf = "^0.32.0"
 toml = "^0.10.2"
 mypy = "^0.942"
 isort = "^5.10.1"
-
-[tool.poetry.scripts]
-volttron-resource-bridge = "resource_bridge.agent:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

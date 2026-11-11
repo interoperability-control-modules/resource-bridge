@@ -24,6 +24,8 @@
 """Configuration of the Resource Bridge: which device publications are bridged into which devices."""
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from icm.resources.definitions import DeliveryPolicy, LocalAlias, LocalCanonical, parse_definition
+
 
 def _uai(value) -> list[str]:
     """A UAI as a list of segments; ``"site1/pv_inverter"`` is accepted for convenience."""
@@ -44,6 +46,15 @@ class EndConfig(BaseModel):
     uai: list[str]
     bus: bool = Field(default=False, description='Treat the UAI as a topic on the VOLTTRON bus rather than as a device.')
     topic: str | None = Field(default=None, description='Bus end only: the topic, when it is not the UAI joined with "/".')
+    definition: LocalCanonical | LocalAlias | None = Field(
+        default=None, description='The resource this end is, declared here instead of resolved through the presentation'
+                                  ' service: a canonical (data_format, publication_topic, rpc_topic) or an alias'
+                                  ' (target_format, codec, transform). The UAI then only names the end.')
+
+    @field_validator('definition', mode='before')
+    @classmethod
+    def _parse_definition(cls, value):
+        return parse_definition(value) if isinstance(value, dict) else value
 
     @model_validator(mode='before')
     @classmethod
@@ -76,6 +87,9 @@ class BridgeConfig(BaseModel):
     points: list[str] | None = Field(default=None, description='Only these source points are bridged (device sources; all by default).')
     write_unchanged: bool = Field(default=False, description='Write a point again even when its value is the one last'
                                                              ' written to the target (by default only changes are written).')
+    delivery: DeliveryPolicy | None = Field(
+        default=None, description='When the source\'s arrivals become one message for the chain: each (default), complete,'
+                                  ' merge, interval or trigger, with their options (icm.resources.DeliveryPolicy).')
 
     @property
     def key(self) -> str:
